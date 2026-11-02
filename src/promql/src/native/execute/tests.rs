@@ -1568,6 +1568,7 @@ fn a_window_map_window_chain_keeps_each_layer_on_its_own_grid() {
         &map_schema,
         &inner_series,
         &[MapOp::Math(MathOp::Abs)],
+        None,
         &mut |_| Ok(()),
     )
     .unwrap()
@@ -10879,6 +10880,7 @@ fn a_label_only_map_keeps_histogram_samples() {
         &schema,
         &chunk,
         &[MapOp::Label(Arc::new(rewrite))],
+        None,
         &mut |_| Ok(()),
     )
     .unwrap()
@@ -10915,6 +10917,7 @@ fn a_label_change_admits_the_label_it_writes_before_building_it() {
         &schema,
         &chunk,
         &[MapOp::Label(Arc::clone(&join))],
+        None,
         &mut |bytes| {
             admitted += bytes;
             Ok(())

@@ -37,6 +37,7 @@ use std::hash::{Hash, Hasher};
 use std::mem::size_of;
 use std::sync::Arc;
 
+use common_query::promql_annotations::PromqlAnnotationCollector;
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::DFSchemaRef;
@@ -859,7 +860,17 @@ impl ExecutionPlan for AggregateFinalizeExec {
         // the reservation is registered here and given back when the stream is dropped, whether the
         // answer was read, dropped half way or refused.
         let answer = Arc::new(MemoryConsumer::new("AggregateFinalizeExec output").register(&pool));
-        let state = NativeExecutionState::try_new(&self.suffix, Arc::clone(&pool))?;
+        let mut state = NativeExecutionState::try_new(&self.suffix, Arc::clone(&pool))?;
+        // The global suffix runs the same native kernels as a producer, so its warnings and infos go
+        // to the same query collector. Without one nothing is recorded, which is what an internal
+        // execution sees.
+        if let Some(collector) = context
+            .session_config()
+            .get_extension::<PromqlAnnotationCollector>()
+        {
+            // `get_extension` hands back the shared collector; the executor keeps its own handle.
+            state.set_annotations(Some((*collector).clone()));
+        }
         state.register_metrics(&self.metric, 0);
         let input_id = state.input_ids(0).next().ok_or_else(|| {
             DataFusionError::Execution("AggregateFinalize suffix has no source-0 input".to_string())

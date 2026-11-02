@@ -18,6 +18,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use common_query::prometheus::is_prometheus_stale_nan;
+use common_query::promql_annotations::PromqlAnnotationCollector;
 use datafusion::arrow::array::{Array, Float64Array};
 use datafusion::arrow::buffer::Buffer;
 use datafusion::error::{DataFusionError, Result};
@@ -175,6 +176,7 @@ pub struct RangeEvaluator {
     replay: Replay,
     kernel: WindowKernel,
     function: Option<RangeFunction>,
+    annotations: Option<PromqlAnnotationCollector>,
     output_schema: Arc<SeriesSchema>,
     output: GridSeriesBuilder,
     /// The grid of evaluated input series, such as the inner result of a subquery; `None` for
@@ -637,6 +639,7 @@ impl RangeEvaluator {
             replay,
             kernel,
             function: None,
+            annotations: None,
             output: GridSeriesBuilder::try_new(output_schema.clone())?,
             input_grid: input.eval_grid.as_ref().map(|grid| grid.spec()),
             output_schema,
@@ -671,6 +674,11 @@ impl RangeEvaluator {
     #[cfg(test)]
     pub(crate) fn batch_call_count(&self) -> usize {
         self.batch_calls
+    }
+
+    /// Sets the collector used for annotations produced by histogram range evaluation.
+    pub fn set_annotations(&mut self, collector: Option<PromqlAnnotationCollector>) {
+        self.annotations = collector;
     }
 
     /// An estimate of the bytes this evaluator keeps between pushes.
@@ -1268,6 +1276,7 @@ impl RangeEvaluator {
                 fields: &self.fields,
                 kernel: &mut self.kernel,
                 function: self.function,
+                annotations: self.annotations.as_ref(),
                 range_ms: self.window.range_ms,
                 offset_ms: self.window.offset_ms,
                 modifier: self.window.modifier,
@@ -1399,6 +1408,7 @@ struct RowEvaluator<'a> {
     fields: &'a [FieldSamples],
     kernel: &'a mut WindowKernel,
     function: Option<RangeFunction>,
+    annotations: Option<&'a PromqlAnnotationCollector>,
     range_ms: i64,
     offset_ms: i64,
     modifier: Option<RangeModifier>,
@@ -1438,6 +1448,7 @@ impl RowEvaluator<'_> {
                     self.range_ms,
                     self.offset_ms,
                     &mut *self.kernel,
+                    self.annotations,
                 )?,
                 _ => floats.and_then(|window| (self.kernel)(window).map(GridSample::Float)),
             });

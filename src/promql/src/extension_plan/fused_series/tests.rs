@@ -36,8 +36,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
+use common_query::native_histogram::native_histogram_value_type;
 use common_query::series_frame::unpack_evaluated_series;
-use datafusion::arrow::array::{Array, Float64Array, StringArray, TimestampMillisecondArray};
+use datafusion::arrow::array::{
+    Array, Float64Array, StringArray, StructArray, TimestampMillisecondArray, UInt32Array,
+};
 use datafusion::arrow::buffer::{Buffer, ScalarBuffer};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -64,11 +67,15 @@ use datafusion::physical_plan::{
     RecordBatchStream, SendableRecordBatchStream, collect, displayable,
 };
 use datafusion::prelude::SessionContext;
+use datatypes::data_type::DataType as _;
 use datatypes::prelude::ConcreteDataType;
 use datatypes::series::frame::{
     FrameContent, FrameLabelMode, LABEL_DECODE_VERSION, LabelDecodeColumn, LabelDecodeEncoding,
     LabelDecodeSpec, LabelDecodeTag, SeriesFrameDeclaration, pack_raw_series_chunk,
     raw_series_frame_schema, series_frame_schema,
+};
+use datatypes::series::histogram::{
+    BucketSideView, CounterResetHint, HistogramBatchBuilder, HistogramView,
 };
 use datatypes::series::raw::{RawSeriesChunk, RawTimestamps};
 use datatypes::series::samples::{FieldSpec, Samples, Series, SeriesFields, SeriesSchema};
@@ -80,8 +87,8 @@ use store_api::region_engine::RawLabelSource;
 mod frame_output;
 
 use super::{
-    FusedOutputFormat, FusedSeries, FusedSeriesBinding, MAX_TAG_COUNT, OutputColumn, POLL_BUDGET,
-    series_to_record_batch,
+    FieldKind, FusedOutputFormat, FusedSeries, FusedSeriesBinding, MAX_TAG_COUNT, OutputColumn,
+    POLL_BUDGET, series_to_record_batch,
 };
 use crate::evaluated::EvaluatedChunk;
 use crate::extension_plan::aggregate_exchange::state_schema;
@@ -2812,7 +2819,10 @@ fn a_chunk_of_several_runs_converts_its_own_rows_only() {
     // The columns of `output_schema`, in its order: the field, the two tags, then the time.
     let batch = series_to_record_batch(
         &[
-            OutputColumn::Field(0),
+            OutputColumn::Field {
+                index: 0,
+                kind: FieldKind::Float,
+            },
             OutputColumn::Tag(0),
             OutputColumn::Tag(1),
             OutputColumn::Time,
@@ -2843,6 +2853,114 @@ fn a_chunk_of_several_runs_converts_its_own_rows_only() {
         "the carried rows keep their absolute grid positions"
     );
     assert_eq!(vec![7.0, 8.0, 11.0], values.values()[..3].to_vec());
+}
+
+/// A histogram field converts into the canonical struct column, one payload per carried row.
+#[test]
+fn a_histogram_field_converts_into_the_canonical_struct_column() {
+    let grid = grid();
+    let axis = TimeAxis::from_grid_spans(
+        Arc::clone(&grid),
+        // Grid positions 0..2 and 4..5: position 2 and 3 hold no row at all.
+        vec![GridSpan::new(0, 2), GridSpan::new(4, 1)],
+    )
+    .expect("the spans are increasing and inside the grid");
+    let mut builder = HistogramBatchBuilder::new();
+    let first = push_histogram(&mut builder, 1.0, 2.0);
+    let second = push_histogram(&mut builder, 3.0, 4.0);
+    let third = push_histogram(&mut builder, 5.0, 6.0);
+    let samples = Samples::try_from_histogram(
+        UInt32Array::from(vec![first, second, third]),
+        builder.finish().expect("the payload table builds"),
+    )
+    .expect("three histogram samples");
+    let chunk = EvaluatedChunk::try_new(
+        Series {
+            metric: SeriesLabels::try_new(Some(Arc::from(METRIC)), Vec::new())
+                .expect("one metric name is a legal identity"),
+            time: axis,
+            fields: SeriesFields::try_from_vec(vec![samples])
+                .expect("one field is a legal field list"),
+        },
+        true,
+    )
+    .expect("a chunk on a grid");
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(VALUE, native_histogram_value_type().as_arrow_type(), true),
+        Field::new(
+            TIME,
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        ),
+    ]));
+    let batch = series_to_record_batch(
+        &[
+            OutputColumn::Field {
+                index: 0,
+                kind: FieldKind::Histogram,
+            },
+            OutputColumn::Time,
+        ],
+        &[],
+        &schema,
+        &chunk,
+    )
+    .expect("the histogram chunk converts");
+
+    let column = batch
+        .column_by_name(VALUE)
+        .expect("the batch has its field column")
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .expect("a histogram column is a struct");
+    assert_eq!(3, batch.num_rows(), "only the carried rows are rows");
+    assert_eq!(3, column.len());
+    let sums = column
+        .column_by_name("sum")
+        .expect("the canonical payload has a sum")
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("the sum is a float");
+    assert_eq!(vec![2.0, 4.0, 6.0], sums.values().to_vec());
+    let stamps = batch
+        .column_by_name(TIME)
+        .expect("the batch has its time column")
+        .as_any()
+        .downcast_ref::<TimestampMillisecondArray>()
+        .expect("the time column is a millisecond timestamp");
+    let grid_stamps = grid.timestamps().expect("the grid timestamps build");
+    assert_eq!(
+        vec![grid_stamps[0], grid_stamps[1], grid_stamps[4]],
+        stamps.values()[..3].to_vec(),
+        "the carried rows keep their absolute grid positions"
+    );
+}
+
+/// Appends one `count`/`sum` histogram to `builder` and returns its payload index.
+fn push_histogram(builder: &mut HistogramBatchBuilder, count: f64, sum: f64) -> u32 {
+    builder
+        .push(HistogramView {
+            schema: 0,
+            zero_threshold: 0.0,
+            sum,
+            count,
+            zero_count: count,
+            reset_hint: CounterResetHint::Unknown,
+            start_timestamp: None,
+            custom_values: &[],
+            positive: BucketSideView {
+                span_offsets: &[],
+                span_lengths: &[],
+                buckets: &[],
+            },
+            negative: BucketSideView {
+                span_offsets: &[],
+                span_lengths: &[],
+                buckets: &[],
+            },
+        })
+        .expect("the histogram is a legal payload")
 }
 
 /// Every message in `error`'s chain, so an error a layer above wrapped is still read.

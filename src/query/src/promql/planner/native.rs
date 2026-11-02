@@ -38,6 +38,7 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use common_catalog::consts::{METRIC_ENGINE, MITO_ENGINE, MITO2_ENGINE};
+use common_query::native_histogram::native_histogram_value_type;
 use common_query::prelude::OTLP_AGGREGATION_TEMPORALITY_LABEL;
 use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, TimeUnit as ArrowTimeUnit};
 use datafusion::common::{DFSchema, DFSchemaRef};
@@ -46,12 +47,13 @@ use datafusion::execution::memory_pool::UnboundedMemoryPool;
 use datafusion::logical_expr::{Extension, LogicalPlan, LogicalPlanBuilder, TableScanBuilder};
 use datafusion::prelude::Expr as DfExpr;
 use datafusion_expr::Expr;
+use datatypes::data_type::DataType as _;
 use datatypes::series::SeriesOrdering;
 use datatypes::series::samples::{FieldSpec, SeriesSchema};
 use promql::extension_plan::{AggregateFinalize, FusedSeries, FusedSeriesBinding, RawSeriesSource};
 use promql::native::execute::NativeExecutionState;
 use promql::native::plan::{
-    BoundAggregate, BoundVectorOp, Grouping, MapOp, NativeExpr, NativeNode, NativeType,
+    BoundAggregate, BoundVectorOp, Grouping, MapOp, NativeExpr, NativeNode, NativeType, SampleKind,
     reads_across_series,
 };
 use promql::vector_match::{Cardinality, MatchingLabels, SetOp};
@@ -264,7 +266,7 @@ impl PromPlanner {
                     .collect(),
                 _ => vec![DEFAULT_FIELD_COLUMN.to_string()],
             };
-            let output_schema = fused_output_schema(&values, &[], &time_index)?;
+            let output_schema = fused_output_schema(&values, &[], &time_index, SampleKind::Float)?;
             let node = FusedSeries::try_new(
                 Arc::from(prom_expr.to_string()),
                 tree,
@@ -289,6 +291,9 @@ impl PromPlanner {
         let preparation = async {
             let mut prepared: Vec<PreparedInput> = Vec::new();
             let mut single_input_context = None;
+            // The one sample kind every selector of this statement carries, which the output
+            // columns are declared from.
+            let mut statement_kind: Option<SampleKind> = None;
             // The first metric logical-table id a selector's rewrite carried, and whether a later one
             // carried a different id. See the `cross_table` use below.
             let mut logical_scan_id: Option<u32> = None;
@@ -443,16 +448,32 @@ impl PromPlanner {
                 if selectors.len() > 1 && table_meta.partition_column_names().next().is_some() {
                     return Ok(None);
                 }
-                // The region's columnar series-index samples, one of the readers this scan may be
-                // served by, store `Float64` fields only, and the logical plan cannot tell which
-                // reader arrives. So every field has to be `Float64`: an integer, a `Float32`, a
-                // decimal, a string or a native histogram field keeps the existing plan, which the
-                // physical layer still serves.
-                if !fields.iter().all(|field| {
-                    Self::field_column_type(input.schema(), field) == Some(&ArrowDataType::Float64)
-                }) {
+                // A field's samples are floats or the canonical native histogram struct; the raw
+                // frame keeps those payloads apart per field and the runtime reads each field's
+                // own. Any other stored type - an integer, `Float32`, a decimal or a string -
+                // keeps the existing plan, which the physical layer still serves.
+                //
+                // One kind per query: a table that stores both a float and a histogram field holds
+                // the two lanes of one series, and choosing between them is the existing planner's
+                // alternative-sample rule. Until this route reads that rule, such a statement also
+                // keeps the existing plan.
+                let mut field_kinds = Vec::with_capacity(fields.len());
+                for field in &fields {
+                    match Self::field_column_type(input.schema(), field) {
+                        Some(ArrowDataType::Float64) => field_kinds.push(SampleKind::Float),
+                        Some(data_type) if data_type == &Self::native_histogram_arrow_type() => {
+                            field_kinds.push(SampleKind::Histogram)
+                        }
+                        _ => return Ok(None),
+                    }
+                }
+                let Some(sample_kind) = SampleKind::uniform(field_kinds) else {
+                    return Ok(None);
+                };
+                if statement_kind.is_some_and(|kind| kind != sample_kind) {
                     return Ok(None);
                 }
+                statement_kind = Some(sample_kind);
                 let series_schema = Arc::new(SeriesSchema {
                     fields: fields
                         .iter()
@@ -474,11 +495,18 @@ impl PromPlanner {
                 }
                 prepared.push((input, series_schema, Some(Arc::from(metric)), time, tags));
             }
-            Ok(Some((prepared, single_input_context, logical_ids_differ)))
+            Ok(Some((
+                prepared,
+                single_input_context,
+                logical_ids_differ,
+                statement_kind.unwrap_or(SampleKind::Float),
+            )))
         }
         .await;
         self.ctx = original_context;
-        let Some((mut prepared, single_input_context, logical_ids_differ)) = preparation? else {
+        let Some((mut prepared, single_input_context, logical_ids_differ, sample_kind)) =
+            preparation?
+        else {
             return Ok(None);
         };
         // Selectors over one table share one region, so the node runs there over every scan. When
@@ -641,6 +669,13 @@ impl PromPlanner {
         // tree multi-input, and the one execution above then reads the Mito input through its own
         // raw source as well.
         let multi_input = selectors.len() > 1 && logical_ids_differ;
+        // A native histogram statement keeps one field kind through the tree, and the shapes this
+        // route answers are the per-partition ones below. The aggregate split folds float state and
+        // the multi-input node reads several scans, so both keep the existing plan for histograms
+        // rather than running a tree whose output the runtime could not finish.
+        if sample_kind == SampleKind::Histogram && (multi_input || !per_partition) {
+            return Ok(None);
+        }
         // A multi-input tree skips the split below, so the refusals the split makes for reasons that
         // are not about what the runtime computes have to be made here.
         //
@@ -678,7 +713,8 @@ impl PromPlanner {
             let (legacy_fields, legacy_tags) = self
                 .legacy_output_columns(prom_expr, query_engine_state)
                 .await?;
-            let output_schema = fused_output_schema(&legacy_fields, &legacy_tags, &time)?;
+            let output_schema =
+                fused_output_schema(&legacy_fields, &legacy_tags, &time, SampleKind::Float)?;
             let Some(rawinput) = children.into_iter().next() else {
                 return Ok(None);
             };
@@ -753,7 +789,22 @@ impl PromPlanner {
         {
             return Ok(None);
         }
-        let output_schema = fused_output_schema(&root_fields, &output_tags, &time)?;
+        // The output columns follow the kind the tree answers with: `histogram_count` and the other
+        // native-histogram readers reduce a histogram field to floats, while a selector, a range
+        // function that keeps histograms and a label rewrite keep the kind they were given.
+        // A float tree keeps the schema it declared before this walk existed: every output field
+        // column is `Float64`. A histogram tree names its columns from the kind its root answers
+        // with, and a shape this walk cannot name keeps the existing plan instead of declaring a
+        // column the first batch might not fill.
+        let root_kind = if sample_kind == SampleKind::Histogram {
+            match tree.root().output_sample_kind(sample_kind) {
+                Some(kind) => kind,
+                None => return Ok(None),
+            }
+        } else {
+            SampleKind::Float
+        };
+        let output_schema = fused_output_schema(&root_fields, &output_tags, &time, root_kind)?;
         // Across tables the region scans are bound by their `RawSeriesSource` children, and this is
         // also the binding a node over more than one input needs: such a node reads frames that
         // already carry their own labels, so it binds neither tags nor one metric name of its own -
@@ -850,6 +901,7 @@ fn fused_output_schema(
     fields: &[String],
     tags: &[String],
     time_index: &str,
+    kind: SampleKind,
 ) -> Result<DFSchemaRef> {
     let mut columns = Vec::with_capacity(fields.len() + tags.len() + 1);
     columns.push((
@@ -860,11 +912,12 @@ fn fused_output_schema(
             false,
         )),
     ));
+    let field_type = match kind {
+        SampleKind::Float => ArrowDataType::Float64,
+        SampleKind::Histogram => native_histogram_value_type().as_arrow_type(),
+    };
     for name in fields {
-        columns.push((
-            None,
-            Arc::new(Field::new(name, ArrowDataType::Float64, true)),
-        ));
+        columns.push((None, Arc::new(Field::new(name, field_type.clone(), true))));
     }
     for name in tags {
         columns.push((None, Arc::new(Field::new(name, ArrowDataType::Utf8, true))));
